@@ -143,3 +143,90 @@ A **Star** button in the article viewer. Tapping it keeps the article on the dev
 4. A failed or interrupted sync never loses a queued star.
 5. Invariants 1 to 6 in `AGENTS.md` still hold, with the new star invariant added, and the new code paths have tests.
 6. README documents the button, the Starred view and the cache behaviour.
+
+---
+
+## 3. Optional image support
+
+Status: not started. Needs investigation first; the first step is a prototype on a real device, not a full build.
+
+**This must be a user option, off by default.** Today KOFever is text only (images appear as `[Image: ...]`), and that must stay the behaviour for anyone who does not switch images on. A user who leaves the option off must see no extra downloads, no extra storage use and no change in sync time. Every part of this plan is conditional on that setting.
+
+### 3.1 Why it is an option and not the default
+
+- **Storage and time**: a typical article can carry several images, often hundreds of KB each. A cache of 3000 articles with images could be hundreds of MB, on flash storage that is already shared with books. [Guess at sizes; measure on real feeds.]
+- **Sync time and data**: the first sync already downloads articles 50 at a time. Images multiply the number of requests and the bytes. On a slow Kindle Wi-Fi connection this could turn a minute into many minutes. [Guess]
+- **Privacy**: article text comes from the user's own FreshRSS server, but images come from the publishers' servers, and from trackers and ad hosts. Downloading them tells those hosts the device's IP address and when it synced. Many users run FreshRSS precisely to avoid that, so they should opt in knowingly.
+- **E-ink**: many images are photos that look poor in grayscale, and decorative images add nothing. Text-only is a sensible default on this hardware. [Judgement, not measured.]
+- **Memory**: a large image decoded on a low-RAM device can be slow or fail. [Guess; measure.]
+
+### 3.2 What the servers give us
+
+- Both APIs return the article body as HTML in one field (Fever `html`, Google Reader `summary.content`), with `<img>` tags pointing at the publisher's own image URLs. [Verified for FreshRSS: `p/api/fever.php` and `app/Models/Entry.php`.] Neither API sends image data; the plugin must fetch each image itself.
+- FreshRSS does not proxy or cache images by default. [Verify: there may be an image proxy extension, and some feeds put the image in an enclosure or a media tag instead of the body.]
+- The URL in an `<img>` is often not the one to use: lazy-loading sites put the real URL in `data-src` or similar and a placeholder in `src`, and many give a `srcset` of sizes. [Guess about how common this is; check real feeds.] Tracking pixels (1x1 images) and relative URLs also occur.
+
+### 3.3 What KOReader gives us
+
+- **`ScrollHtmlWidget`** renders HTML with images from a local folder. It takes `html_body`, `css` and `html_resource_directory`, which is passed straight to MuPDF's `openDocumentFromText`, so relative `<img src>` values resolve against that folder. [Verified: `frontend/ui/widget/scrollhtmlwidget.lua` and `htmlboxwidget.lua`.]
+- **QuickRSS** already does this. It downloads each image into an `images/` folder, names it from a hash of its URL, rewrites the `src` to the local file name, strips `width`, `height` and `style` so the CSS controls the layout, and shows the article in `ScrollHtmlWidget`. [Verified: `qewer33/quickrss.koplugin`, `modules/data/images.lua` and `modules/ui/article_reader.lua`.] This is the closest working example.
+- **News Downloader** has a global "Never download images" setting and an include-images choice per feed, which is the same kind of option as this plan. It prefers the 2x image from `srcset` when there is one and recognises png, jpg, gif and svg by extension. [Verified: `plugins/newsdownloader.koplugin`.] It downloads up to 10 images at once. [Verified, `MAX_CONCURRENT_DOWNLOADS`; whether that is wise on a Kindle is a Guess.]
+- **`ImageViewer`** shows a single image full screen with zoom. [Verified to exist in `frontend/ui/widget/imageviewer.lua`; whether it suits tapping an image inside an article is not checked.]
+- **`TextViewer`**, which KOFever uses now, is plain text only and cannot show images. [Verified by its use: it takes text, not HTML.]
+- Whether MuPDF in KOReader displays WebP, and how it handles animated GIF and SVG, is not checked. [Verify] Many sites serve WebP, so this decides how much of the web images work.
+
+### 3.4 Possible approaches
+
+**A. Tap to load one image (smallest step).** Keep the plain-text viewer. Show `[Image: alt]` as today, and add an **Images** button that lists the article's image URLs and downloads and shows the chosen one in `ImageViewer`. Nothing is downloaded until the user asks, so cost and privacy impact are small. It needs Wi-Fi at reading time, so it does not help offline, unless the image is cached after first view.
+
+**B. Download at sync, show in an HTML viewer.** Store the article as sanitised HTML, download its images during sync into a folder the viewer can use, and show it in `ScrollHtmlWidget`, as QuickRSS does. This is the full feature and the most costly. The viewer is a second code path to keep, and the Previous, Next, position and read-marking behaviour in `main.lua` would need to be rebuilt around it, since `TextViewer`'s button row would not be available. [Verify: whether `ScrollHtmlWidget` can sit inside the existing `TextViewer`-style button layout; QuickRSS wrote its own full reader of about 600 lines.]
+
+**C. Build an EPUB or HTML file per article and open it in KOReader's reader**, as Wallabag and News Downloader do. [Verified: Wallabag downloads `export.epub` and News Downloader's `createEpub` builds one.] KOReader's own reader gives fonts, page turns and image zoom for free. It would break the article list flow (Previous and Next, the return to the list, marking read on open) unless those are hooked in, and each article becomes a file with its images. [Judgement]
+
+A sensible order is to prototype B with a handful of articles on a Kindle, since it is the one with a working example, and decide from the measured size, speed and memory use whether A is a better fit. [Guess; this is a recommendation, not a finding.]
+
+### 3.5 Proposed settings (all in the KOFever menu)
+
+- **Show images**: checkbox, **off by default**. Everything below only applies when it is on.
+- **When to download**: during sync, or only when an article is opened. [Only if approach B or C is chosen.]
+- **Only on Wi-Fi**: skip images on a metered connection. [Verify: how KOReader reports connection type on Kindle; this may not be detectable.]
+- **Image storage limit** in MB, separate from the article count. When it is reached the oldest images are removed first, and the article falls back to text.
+- **Maximum images per article** and a minimum size, so a long gallery or a tracking pixel is skipped.
+- Turning **Show images** off deletes the cached images straight away and returns to text only, with no effect on the articles themselves.
+
+### 3.6 Design if built (approach B)
+
+Keep the boundaries in `AGENTS.md`:
+
+- **HTML conversion**: `kofever_html.lua` stays free of KOReader requires. It gains a second output mode that returns cleaned HTML plus the list of image URLs found, with `data-src`, `srcset`, relative URLs and tracking pixels dealt with. The existing plain-text conversion is unchanged and is used whenever images are off.
+- **Image fetching**: a new `kofever_images.lua` (HTTP only, no UI) built on `kofever_http.lua`, returning `true, bytes, content_type` or `false, err` with the existing error kinds. It follows redirects with a cap, enforces a per-image size limit and uses the file-download timeouts. Never log image URLs together with credentials; image URLs are public, but follow the existing rule of logging only the method and URL.
+- **Sync**: `kofever_sync.lua` must not do HTTP. It is given an image fetcher in `opts`, calls it after the article text is stored, reports progress through `opts.progress`, and treats any image failure as non-fatal. The article stays text-only and is retried at the next sync. A failed image never fails a sync and never removes cached articles or queued reads (invariants 1 and 2).
+- **Store**: `kofever_store.lua` owns the image files, for example `kofever_images/<article id>/<n>.<ext>`. Removing an item removes its folder, `Store:load` deletes folders the index does not reference, and `Store:clear()` removes them all, so invariant 5 holds for images too. Turning the option off removes the folder tree. The index records only whether an article has images, to keep it small.
+- **Cache limit**: the limit counts articles, so a separate byte budget is needed for images, as in 3.5.
+- **UI** (`main.lua`): the new settings, the viewer path for HTML, and strings in `_()`. When images are off, the current `TextViewer` path is used and nothing changes.
+- Update the data model and invariants sections of `AGENTS.md`, and the README, when built.
+
+### 3.7 Tests
+
+- HTML conversion: fixtures for plain `src`, `data-src`, `srcset`, relative URLs, a 1x1 tracking pixel, an `<img>` with no `src`, and an article with no images.
+- Images off: sync makes no image requests at all and writes no image files (the key behaviour to protect).
+- Images on: the fake server serves images, redirects, errors, an oversized body and a wrong content type; failures leave the text article intact.
+- Store: image folders removed with the article, orphans removed on load, everything removed by Clear cache and by switching the option off, and the byte budget evicting oldest first.
+- Sync interruption: a sync stopped halfway through images leaves a valid cache.
+
+### 3.8 Open questions
+
+- Which of A, B or C? Decide after the prototype in 3.4.
+- Does WebP display? If not, how many articles lose their images, and is it worth converting or requesting another format? [Verify]
+- Does hotlink protection (some hosts refuse requests without a matching referrer) break many images? A browser-like referrer header may help. [Guess; measure on real feeds.]
+- Should the Starred articles in entry 2 keep their images even when the budget would remove them? [Guess: probably yes, once both exist.]
+- How should images interact with the full-article feature in entry 1? Full articles carry more images, so the two will need to be designed together if both are built. [Guess]
+
+### 3.9 Acceptance criteria
+
+1. With **Show images** off (the default), behaviour, storage use and sync time are identical to today.
+2. With it on, an article with images shows them offline, after restarting KOReader and with Wi-Fi off.
+3. Image storage never exceeds the user's limit, and turning the option off removes all cached images.
+4. A failed or interrupted image download never fails a sync, loses an article or loses a queued read.
+5. Invariants 1 to 6 in `AGENTS.md` still hold, with images covered by invariant 5, and the new code paths have tests.
+6. README documents the option, what it downloads, and the privacy and storage cost.
